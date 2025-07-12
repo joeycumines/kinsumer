@@ -1,34 +1,31 @@
-# .PHONY: integration-reset integration-up integration integration-down format lint tidy 
+.DEFAULT_GOAL := all
+ROOT_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
+PROJECT_ROOT := $(patsubst %/,%,$(dir $(ROOT_MAKEFILE)))
 
-# -----------------------------------------------------------------------------
-#  TESTING
-# -----------------------------------------------------------------------------
+GO_MODULE_SLUGS_USE_DEADCODE = $(GO_MODULE_SLUGS)
+DEADCODE_IGNORE_PATTERNS_FILE = .deadcodeignore
+DEADCODE_ERROR_ON_UNIGNORED = true
+DEADCODE_FLAGS = -test
 
+include $(PROJECT_ROOT)/make/go.mk
+
+# --- Start of from upstream / other fork.
+
+.PHONY: integration-reset
 integration-reset: integration-down integration-up
 
-integration-up: 
+.PHONY: integration-up
+integration-up:
 	(cd integration && docker compose -f ./docker-compose.yml up -d)
 	sleep 5
 
-integration-down: 
+.PHONY: integration-down
+integration-down:
 	(cd integration && docker compose -f ./docker-compose.yml down)
 	rm -rf integration/.localstack
 
+.PHONY: integration
 integration: integration-up
 	go test -v ./...
 
-
-# -----------------------------------------------------------------------------
-#  FORMATTING
-# -----------------------------------------------------------------------------
-
-format:
-	GO111MODULE=on go fmt .
-	GO111MODULE=on gofmt -s -w .
-
-lint:
-	GO111MODULE=on go install golang.org/x/lint/golint@latest
-	GO111MODULE=on golint .
-
-tidy:
-	GO111MODULE=on go mod tidy
+# --- End of from upstream / other fork.
