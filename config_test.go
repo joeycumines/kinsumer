@@ -13,6 +13,7 @@ func TestConfigDefault(t *testing.T) {
 	config := NewConfig()
 	err := validateConfig(&config)
 	require.NoError(t, err)
+	require.Nil(t, config.iteratorStartTimestamp)
 }
 
 func TestConfigErrors(t *testing.T) {
@@ -55,6 +56,7 @@ func TestConfigErrors(t *testing.T) {
 
 func TestConfigWithMethods(t *testing.T) {
 	stats := &NoopStatReceiver{}
+	tstamp := time.Now()
 	config := NewConfig().
 		WithBufferSize(1).
 		WithCommitFrequency(1 * time.Second).
@@ -62,6 +64,7 @@ func TestConfigWithMethods(t *testing.T) {
 		WithLeaderActionFrequency(1 * time.Second).
 		WithThrottleDelay(1 * time.Second).
 		WithStats(stats).
+		WithIteratorStartTimestamp(&tstamp).
 		WithUseListShardsForKinesisStreamReady(true)
 
 	err := validateConfig(&config)
@@ -73,5 +76,6 @@ func TestConfigWithMethods(t *testing.T) {
 	require.Equal(t, 1*time.Second, config.shardCheckFrequency)
 	require.Equal(t, 1*time.Second, config.leaderActionFrequency)
 	require.Equal(t, stats, config.stats)
+	require.Equal(t, &tstamp, config.iteratorStartTimestamp)
 	require.Equal(t, true, config.useListShardsForKinesisStreamReady)
 }

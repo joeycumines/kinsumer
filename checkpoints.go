@@ -3,15 +3,17 @@
 package kinsumer
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"github.com/twitchscience/kinsumer/kinsumeriface"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // Note: Not thread safe!
@@ -19,7 +21,7 @@ import (
 type checkpointer struct {
 	shardID               string
 	tableName             string
-	dynamodb              dynamodbiface.DynamoDBAPI
+	dynamodb              kinsumeriface.DynamoDBAPI
 	sequenceNumber        string
 	ownerName             string
 	ownerID               string
@@ -30,6 +32,10 @@ type checkpointer struct {
 	mutex                 sync.Mutex
 	finished              bool
 	finalSequenceNumber   string
+	updateSequencer       chan struct{}
+	lastUpdate            int64
+	commitIntervalCounter time.Duration
+	lastRecordPassed      time.Time
 }
 
 type checkpointRecord struct {
@@ -51,7 +57,7 @@ type checkpointRecord struct {
 func capture(
 	shardID string,
 	tableName string,
-	dynamodbiface dynamodbiface.DynamoDBAPI,
+	dynamodbiface kinsumeriface.DynamoDBAPI,
 	ownerName string,
 	ownerID string,
 	maxAgeForClientRecord time.Duration,
@@ -60,11 +66,11 @@ func capture(
 	cutoff := time.Now().Add(-maxAgeForClientRecord).UnixNano()
 
 	// Grab the entry from dynamo assuming there is one
-	resp, err := dynamodbiface.GetItem(&dynamodb.GetItemInput{
+	resp, err := dynamodbiface.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName:      aws.String(tableName),
 		ConsistentRead: aws.Bool(true),
-		Key: map[string]*dynamodb.AttributeValue{
-			"Shard": {S: aws.String(shardID)},
+		Key: map[string]types.AttributeValue{
+			"Shard": &types.AttributeValueMemberS{Value: shardID},
 		},
 	})
 
@@ -74,7 +80,7 @@ func capture(
 
 	// Convert to struct so we can work with the values
 	var record checkpointRecord
-	if err = dynamodbattribute.UnmarshalMap(resp.Item, &record); err != nil {
+	if err = attributevalue.UnmarshalMap(resp.Item, &record); err != nil {
 		return nil, err
 	}
 
@@ -96,19 +102,19 @@ func capture(
 	record.LastUpdate = now.UnixNano()
 	record.LastUpdateRFC = now.UTC().Format(time.RFC1123Z)
 
-	item, err := dynamodbattribute.MarshalMap(record)
+	item, err := attributevalue.MarshalMap(record)
 	if err != nil {
 		return nil, err
 	}
 
-	attrVals, err := dynamodbattribute.MarshalMap(map[string]interface{}{
+	attrVals, err := attributevalue.MarshalMap(map[string]interface{}{
 		":cutoff":   aws.Int64(cutoff),
 		":nullType": aws.String("NULL"),
 	})
 	if err != nil {
 		return nil, err
 	}
-	if _, err = dynamodbiface.PutItem(&dynamodb.PutItemInput{
+	if _, err = dynamodbiface.PutItem(context.Background(), &dynamodb.PutItemInput{
 		TableName: aws.String(tableName),
 		Item:      item,
 		// The OwnerID doesn't exist if the entry doesn't exist, but PutItem with a marshaled
@@ -117,7 +123,8 @@ func capture(
 			"attribute_not_exists(OwnerID) OR attribute_type(OwnerID, :nullType) OR LastUpdate <= :cutoff"),
 		ExpressionAttributeValues: attrVals,
 	}); err != nil {
-		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "ConditionalCheckFailedException" {
+		var ccfe *types.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) {
 			// We failed to capture it
 			return nil, nil
 		}
@@ -131,9 +138,10 @@ func capture(
 		ownerName:             ownerName,
 		ownerID:               ownerID,
 		stats:                 stats,
-		sequenceNumber:        aws.StringValue(record.SequenceNumber),
+		sequenceNumber:        aws.ToString(record.SequenceNumber),
 		maxAgeForClientRecord: maxAgeForClientRecord,
 		captured:              true,
+		lastUpdate:            record.LastUpdate,
 	}
 
 	return checkpointer, nil
@@ -142,12 +150,20 @@ func capture(
 // commit writes the latest SequenceNumber consumed to dynamo and updates LastUpdate.
 // Returns true if we set Finished in dynamo because the library user finished consuming the shard.
 // Once that has happened, the checkpointer should be released and never grabbed again.
-func (cp *checkpointer) commit() (bool, error) {
+func (cp *checkpointer) commit(commitFrequency time.Duration) (bool, error) {
 	cp.mutex.Lock()
 	defer cp.mutex.Unlock()
+
 	if !cp.dirty && !cp.finished {
-		return false, nil
+		cp.commitIntervalCounter += commitFrequency
+
+		// If we have recently passed a record to the user, don't update the table when we don't have a new sequence number
+		// If we haven't, update at a rate of maxAgeForClientRecord/2
+		if (time.Now().Sub(cp.lastRecordPassed) < cp.maxAgeForClientRecord/2) || (cp.commitIntervalCounter < cp.maxAgeForClientRecord/2) {
+			return false, nil
+		}
 	}
+	cp.commitIntervalCounter = 0 // Reset the counter if we're registering a commit
 	now := time.Now()
 
 	sn := &cp.sequenceNumber
@@ -172,25 +188,32 @@ func (cp *checkpointer) commit() (bool, error) {
 	record.OwnerID = &cp.ownerID
 	record.OwnerName = &cp.ownerName
 
-	item, err := dynamodbattribute.MarshalMap(&record)
+	item, err := attributevalue.MarshalMap(&record)
 	if err != nil {
 		return false, err
 	}
 
-	attrVals, err := dynamodbattribute.MarshalMap(map[string]interface{}{
+	attrVals, err := attributevalue.MarshalMap(map[string]interface{}{
 		":ownerID": aws.String(cp.ownerID),
 	})
 	if err != nil {
 		return false, err
 	}
-	if _, err = cp.dynamodb.PutItem(&dynamodb.PutItemInput{
+	if _, err = cp.dynamodb.PutItem(context.Background(), &dynamodb.PutItemInput{
 		TableName:                 aws.String(cp.tableName),
 		Item:                      item,
 		ConditionExpression:       aws.String("OwnerID = :ownerID"),
 		ExpressionAttributeValues: attrVals,
 	}); err != nil {
+		var ccfe *types.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) && cp.lastUpdate < time.Now().Add(-cp.maxAgeForClientRecord).UnixNano() {
+			return false, nil
+		}
+
 		return false, fmt.Errorf("error committing checkpoint: %s", err)
 	}
+
+	cp.lastUpdate = record.LastUpdate // update our internal copy of last update.
 
 	if sn != nil {
 		cp.stats.Checkpoint()
@@ -203,7 +226,7 @@ func (cp *checkpointer) commit() (bool, error) {
 func (cp *checkpointer) release() error {
 	now := time.Now()
 
-	attrVals, err := dynamodbattribute.MarshalMap(map[string]interface{}{
+	attrVals, err := attributevalue.MarshalMap(map[string]interface{}{
 		":ownerID":        aws.String(cp.ownerID),
 		":sequenceNumber": aws.String(cp.sequenceNumber),
 		":lastUpdate":     aws.Int64(now.UnixNano()),
@@ -212,10 +235,10 @@ func (cp *checkpointer) release() error {
 	if err != nil {
 		return err
 	}
-	if _, err = cp.dynamodb.UpdateItem(&dynamodb.UpdateItemInput{
+	if _, err = cp.dynamodb.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		TableName: aws.String(cp.tableName),
-		Key: map[string]*dynamodb.AttributeValue{
-			"Shard": {S: aws.String(cp.shardID)},
+		Key: map[string]types.AttributeValue{
+			"Shard": &types.AttributeValueMemberS{Value: cp.shardID},
 		},
 		UpdateExpression: aws.String("REMOVE OwnerID, OwnerName " +
 			"SET LastUpdate = :lastUpdate, LastUpdateRFC = :lastUpdateRFC, " +
@@ -223,6 +246,11 @@ func (cp *checkpointer) release() error {
 		ConditionExpression:       aws.String("OwnerID = :ownerID"),
 		ExpressionAttributeValues: attrVals,
 	}); err != nil {
+		var ccfe *types.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) && cp.lastUpdate < time.Now().Add(-cp.maxAgeForClientRecord).UnixNano() {
+			// If we failed conditional check, and the record has expired, assume that another client has legitimately siezed the shard.
+			return nil
+		}
 		return fmt.Errorf("error releasing checkpoint: %s", err)
 	}
 
@@ -243,6 +271,32 @@ func (cp *checkpointer) update(sequenceNumber string) {
 	cp.sequenceNumber = sequenceNumber
 }
 
+// updateFunc returns a function that will update to sequenceNumber when called, but maintains ordering
+func (cp *checkpointer) updateFunc(sequenceNumber string) func() {
+	cp.mutex.Lock()
+	defer cp.mutex.Unlock()
+	// cp.updateSequencer represents whether the previous updateFunc has been called
+	// If nil there is no previous so we should act like there was one already called
+	if cp.updateSequencer == nil {
+		cp.updateSequencer = make(chan struct{})
+		close(cp.updateSequencer)
+	}
+	// Copy the previous channel and create a new one for the link to the next updateFunc
+	updateSequencer := cp.updateSequencer
+	cp.updateSequencer = make(chan struct{})
+	// Return everything in a closure to ensure references are maintained properly
+	return func(prev chan struct{}, sequenceNumber string, next chan struct{}) func() {
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				<-prev // Wait for all prior updateFuncs to be called
+				cp.update(sequenceNumber)
+				close(next) // Allow the next updateFunc to be called
+			})
+		}
+	}(updateSequencer, sequenceNumber, cp.updateSequencer)
+}
+
 // finish marks the given sequence number as the final one for the shard.
 // sequenceNumber is the empty string if we never read anything from the shard.
 func (cp *checkpointer) finish(sequenceNumber string) {
@@ -253,38 +307,33 @@ func (cp *checkpointer) finish(sequenceNumber string) {
 }
 
 // loadCheckpoints returns checkpoint records from dynamo mapped by shard id.
-func loadCheckpoints(db dynamodbiface.DynamoDBAPI, tableName string) (map[string]*checkpointRecord, error) {
+func loadCheckpoints(db kinsumeriface.DynamoDBAPI, tableName string) (map[string]*checkpointRecord, error) {
 	params := &dynamodb.ScanInput{
 		TableName:      aws.String(tableName),
 		ConsistentRead: aws.Bool(true),
 	}
 
-	var records []*checkpointRecord
-	var innerError error
-	err := db.ScanPages(params, func(p *dynamodb.ScanOutput, lastPage bool) (shouldContinue bool) {
-		for _, item := range p.Items {
-			var record checkpointRecord
-			innerError = dynamodbattribute.UnmarshalMap(item, &record)
-			if innerError != nil {
-				return false
-			}
-			records = append(records, &record)
+	var allRecords []checkpointRecord
+	paginator := dynamodb.NewScanPaginator(db, params)
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(context.Background())
+		if err != nil {
+			return nil, err
 		}
 
-		return !lastPage
-	})
+		var recordsIn []checkpointRecord
+		err = attributevalue.UnmarshalListOfMaps(page.Items, &recordsIn)
+		if err != nil {
+			return nil, err
+		}
 
-	if innerError != nil {
-		return nil, innerError
+		allRecords = append(allRecords, recordsIn...)
 	}
 
-	if err != nil {
-		return nil, err
-	}
-
-	checkpointMap := make(map[string]*checkpointRecord, len(records))
-	for _, checkpoint := range records {
-		checkpointMap[checkpoint.Shard] = checkpoint
+	checkpointMap := make(map[string]*checkpointRecord, len(allRecords))
+	for _, checkpoint := range allRecords {
+		checkpointMap[checkpoint.Shard] = &checkpoint
 	}
 	return checkpointMap, nil
 }

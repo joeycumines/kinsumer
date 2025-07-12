@@ -11,8 +11,9 @@ import (
 
 // Config holds all configuration values for a single Kinsumer instance
 type Config struct {
-	stats  StatReceiver
-	logger Logger
+	stats               StatReceiver
+	logger              Logger
+	manualCheckpointing bool
 
 	// ---------- [ Per Shard Worker ] ----------
 	// Time to sleep if no records are found
@@ -23,6 +24,13 @@ type Config struct {
 
 	// Delay between tests for the client or shard numbers changing
 	shardCheckFrequency time.Duration
+
+	// Max age for client record before we consider it stale
+	clientRecordMaxAge *time.Duration
+
+	// Starting timestamp of the shard iterator, if "AT_TIMESTAMP" is the desired iterator type
+	iteratorStartTimestamp *time.Time
+
 	// ---------- [ For the leader (first client alphabetically) ] ----------
 	// Time between leader actions
 	leaderActionFrequency time.Duration
@@ -62,6 +70,15 @@ func NewConfig() Config {
 	}
 }
 
+// WithManualCheckpointing returns a Config with a modified manual checkpointing flag
+// If set to false, records will be automatically checkpointed upon calls to Next()
+// If set to true, NextWithCheckpointer() must be used and the returned checkpointer function
+// must be called when the record is fully processed.
+func (c Config) WithManualCheckpointing(v bool) Config {
+	c.manualCheckpointing = v
+	return c
+}
+
 // WithThrottleDelay returns a Config with a modified throttle delay
 func (c Config) WithThrottleDelay(delay time.Duration) Config {
 	c.throttleDelay = delay
@@ -80,6 +97,12 @@ func (c Config) WithShardCheckFrequency(shardCheckFrequency time.Duration) Confi
 	return c
 }
 
+// WithClientRecordMaxAge returns a config with a modified client record max age
+func (c Config) WithClientRecordMaxAge(clientRecordMaxAge *time.Duration) Config {
+	c.clientRecordMaxAge = clientRecordMaxAge
+	return c
+}
+
 // WithLeaderActionFrequency returns a Config with a modified leader action frequency
 func (c Config) WithLeaderActionFrequency(leaderActionFrequency time.Duration) Config {
 	c.leaderActionFrequency = leaderActionFrequency
@@ -95,6 +118,12 @@ func (c Config) WithBufferSize(bufferSize int) Config {
 // WithStats returns a Config with a modified stats
 func (c Config) WithStats(stats StatReceiver) Config {
 	c.stats = stats
+	return c
+}
+
+// WithIteratorStartTimestamp returns a Config with a modified iteratorStartTimestamp
+func (c Config) WithIteratorStartTimestamp(timestamp *time.Time) Config {
+	c.iteratorStartTimestamp = timestamp
 	return c
 }
 
@@ -144,6 +173,10 @@ func validateConfig(c *Config) error {
 
 	if c.leaderActionFrequency == 0 {
 		return ErrConfigInvalidLeaderActionFrequency
+	}
+
+	if c.clientRecordMaxAge != nil && *c.clientRecordMaxAge < c.shardCheckFrequency {
+		return ErrConfigInvalidClientRecordMaxAge
 	}
 
 	if c.shardCheckFrequency > c.leaderActionFrequency {

@@ -3,14 +3,16 @@
 package kinsumer
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"github.com/twitchscience/kinsumer/kinsumeriface"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/aws/aws-sdk-go/service/kinesis/kinesisiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/kinesis"
+	ktypes "github.com/aws/aws-sdk-go-v2/service/kinesis/types"
+	smithy "github.com/aws/smithy-go"
 )
 
 const (
@@ -18,55 +20,55 @@ const (
 	// total processing speed to getRecordsLimit*5/n where n is the number of parallel clients trying
 	// to consume from the same kinesis stream
 	getRecordsLimit = 10000 // 10,000 is the max according to the docs
-
-	// maxErrorRetries is how many times we will retry on a shard error
-	maxErrorRetries = 3
-
-	// errorSleepDuration is how long we sleep when an error happens, this is multiplied by the number
-	// of retries to give a minor backoff behavior
-	errorSleepDuration = 1 * time.Second
 )
 
 // getShardIterator gets a shard iterator after the last sequence number we read or at the start of the stream
-func getShardIterator(k kinesisiface.KinesisAPI, streamName string, shardID string, sequenceNumber string) (string, error) {
-	shardIteratorType := kinesis.ShardIteratorTypeAfterSequenceNumber
+func getShardIterator(k kinsumeriface.KinesisAPI, streamName string, shardID string, sequenceNumber string, iteratorStartTimestamp *time.Time) (string, error) {
+	shardIteratorType := ktypes.ShardIteratorTypeAfterSequenceNumber
 
 	// If we do not have a sequenceNumber yet we need to get a shardIterator
 	// from the horizon
 	ps := aws.String(sequenceNumber)
-	if sequenceNumber == "" {
-		shardIteratorType = kinesis.ShardIteratorTypeTrimHorizon
+	if sequenceNumber == "" && iteratorStartTimestamp != nil {
+		shardIteratorType = ktypes.ShardIteratorTypeAtTimestamp
+		ps = nil
+	} else if sequenceNumber == "" {
+		shardIteratorType = ktypes.ShardIteratorTypeTrimHorizon
 		ps = nil
 	} else if sequenceNumber == "LATEST" {
-		shardIteratorType = kinesis.ShardIteratorTypeLatest
+		shardIteratorType = ktypes.ShardIteratorTypeLatest
 		ps = nil
 	}
 
-	resp, err := k.GetShardIterator(&kinesis.GetShardIteratorInput{
+	resp, err := k.GetShardIterator(context.Background(), &kinesis.GetShardIteratorInput{
 		ShardId:                aws.String(shardID),
-		ShardIteratorType:      &shardIteratorType,
+		ShardIteratorType:      shardIteratorType,
 		StartingSequenceNumber: ps,
 		StreamName:             aws.String(streamName),
+		Timestamp:              iteratorStartTimestamp,
 	})
-	return aws.StringValue(resp.ShardIterator), err
+	if err != nil {
+		return "", err
+	}
+	return aws.ToString(resp.ShardIterator), err
 }
 
 // getRecords returns the next records and shard iterator from the given shard iterator
-func getRecords(k kinesisiface.KinesisAPI, iterator string) (records []*kinesis.Record, nextIterator string, lag time.Duration, err error) {
+func getRecords(k kinsumeriface.KinesisAPI, iterator string) (records []ktypes.Record, nextIterator string, lag time.Duration, err error) {
 	params := &kinesis.GetRecordsInput{
-		Limit:         aws.Int64(getRecordsLimit),
+		Limit:         aws.Int32(getRecordsLimit),
 		ShardIterator: aws.String(iterator),
 	}
 
-	output, err := k.GetRecords(params)
+	output, err := k.GetRecords(context.Background(), params)
 
 	if err != nil {
 		return nil, "", 0, err
 	}
 
 	records = output.Records
-	nextIterator = aws.StringValue(output.NextShardIterator)
-	lag = time.Duration(aws.Int64Value(output.MillisBehindLatest)) * time.Millisecond
+	nextIterator = aws.ToString(output.NextShardIterator)
+	lag = time.Duration(aws.ToInt64(output.MillisBehindLatest)) * time.Millisecond
 
 	return records, nextIterator, lag, nil
 }
@@ -130,6 +132,7 @@ func (k *Kinsumer) consume(shardID string) {
 
 	// finished means we have reached the end of the shard but haven't necessarily processed/committed everything
 	finished := false
+
 	// Make sure we release the shard when we are done.
 	defer func() {
 		innerErr := checkpointer.release()
@@ -140,7 +143,7 @@ func (k *Kinsumer) consume(shardID string) {
 	}()
 
 	// Get the starting shard iterator
-	iterator, err := getShardIterator(k.kinesis, k.streamName, shardID, sequenceNumber)
+	iterator, err := getShardIterator(k.kinesis, k.streamName, shardID, sequenceNumber, k.config.iteratorStartTimestamp)
 	if err != nil {
 		k.shardErrors <- shardConsumerError{shardID: shardID, action: "getShardIterator", err: err}
 		return
@@ -149,8 +152,9 @@ func (k *Kinsumer) consume(shardID string) {
 	// no throttle on the first request.
 	nextThrottle := time.After(0)
 
-	retryCount := 0
-
+	// lastSeqToCheckp is used to check if we have more data to checkpoint before we exit
+	var lastSeqToCheckp string
+	// lastSeqNum is used to check if a batch of data is the last in the stream
 	var lastSeqNum string
 mainloop:
 	for {
@@ -163,9 +167,9 @@ mainloop:
 		// Handle async actions, and throttle requests to keep kinesis happy
 		select {
 		case <-k.stop:
-			return
+			break mainloop
 		case <-commitTicker.C:
-			finishCommitted, err := checkpointer.commit()
+			finishCommitted, err := checkpointer.commit(k.config.commitFrequency)
 			if err != nil {
 				k.shardErrors <- shardConsumerError{shardID: shardID, action: "checkpointer.commit", err: err}
 				return
@@ -189,27 +193,28 @@ mainloop:
 		records, next, lag, err := getRecords(k.kinesis, iterator)
 
 		if err != nil {
-			if awsErr, ok := err.(awserr.Error); ok {
-				origErrStr := ""
-				if awsErr.OrigErr() != nil {
-					origErrStr = fmt.Sprintf("(%s) ", awsErr.OrigErr())
-				}
-				k.config.logger.Log("Got error: %s %s %sretry count is %d / %d", awsErr.Code(), awsErr.Message(), origErrStr, retryCount, maxErrorRetries)
-				// Only retry for errors that should be retried; notably, don't retry serialization errors because something bad is happening
-				shouldRetry := request.IsErrorRetryable(err) || request.IsErrorThrottle(err)
-				if shouldRetry && retryCount < maxErrorRetries {
-					retryCount++
+			var ae smithy.APIError
+			if errors.As(err, &ae) {
+				origErrStr := fmt.Sprintf("(%s) ", ae)
+				k.config.logger.Log("Got error: %s %s %s", ae.ErrorCode(), ae.ErrorMessage(), origErrStr)
 
-					// casting retryCount here to time.Duration purely for the multiplication, there is
-					// no meaning to retryCount nanoseconds
-					time.Sleep(errorSleepDuration * time.Duration(retryCount))
+				var eie *ktypes.ExpiredIteratorException
+				if errors.As(err, &eie) {
+					k.config.logger.Log("Got error: %s %s %s", eie.ErrorCode(), eie.ErrorMessage(), origErrStr)
+					newIterator, ierr := getShardIterator(k.kinesis, k.streamName, shardID, lastSeqToCheckp, nil)
+					if ierr != nil {
+						k.shardErrors <- shardConsumerError{shardID: shardID, action: "getShardIterator", err: err}
+						return
+					}
+					iterator = newIterator
+
+					// retry infinitely after expired iterator is renewed successfully
 					continue mainloop
 				}
 			}
 			k.shardErrors <- shardConsumerError{shardID: shardID, action: "getRecords", err: err}
 			return
 		}
-		retryCount = 0
 
 		// Put all the records we got onto the channel
 		k.config.stats.EventsFromKinesis(len(records), shardID, lag)
@@ -221,7 +226,7 @@ mainloop:
 				for {
 					select {
 					case <-commitTicker.C:
-						finishCommitted, err := checkpointer.commit()
+						finishCommitted, err := checkpointer.commit(k.config.commitFrequency)
 						if err != nil {
 							k.shardErrors <- shardConsumerError{shardID: shardID, action: "checkpointer.commit", err: err}
 							return
@@ -230,20 +235,62 @@ mainloop:
 							return
 						}
 					case <-k.stop:
-						return
+						break mainloop
 					case k.records <- &consumedRecord{
-						record:       record,
+						record:       &record,
 						checkpointer: checkpointer,
 						retrievedAt:  retrievedAt,
 					}:
+						checkpointer.lastRecordPassed = time.Now() // Mark the time so we don't retain shards when we're too slow to do so
+						lastSeqToCheckp = aws.ToString(record.SequenceNumber)
 						break RecordLoop
 					}
 				}
 			}
 
 			// Update the last sequence number we saw, in case we reached the end of the stream.
-			lastSeqNum = aws.StringValue(records[len(records)-1].SequenceNumber)
+			lastSeqNum = aws.ToString(records[len(records)-1].SequenceNumber)
 		}
 		iterator = next
+	}
+	// Handle checkpointer updates which occur after a stop request comes in (whose originating records were before)
+
+	// commit first in case the checkpointer has been updates since the last commit.
+	checkpointer.commitIntervalCounter = 0 // Reset commitIntervalCounter to avoid retaining ownership if there's no new sequence number
+	_, err1 := checkpointer.commit(0 * time.Millisecond)
+	if err1 != nil {
+		k.shardErrors <- shardConsumerError{shardID: shardID, action: "checkpointer.commit", err: err}
+		return
+	}
+	// Resume commit loop for some time, ensuring that we don't retain ownership unless there's a new sequence number.
+	timeoutCounter := 0
+
+	// If we have committed the last sequence number returned to the user, just return. Otherwise, keep committing until we reach that state
+	if !checkpointer.dirty && checkpointer.sequenceNumber == lastSeqToCheckp {
+		return
+	}
+
+	for {
+		select {
+		case <-commitTicker.C:
+			timeoutCounter += int(k.config.commitFrequency)
+			checkpointer.commitIntervalCounter = 0
+			// passing 0 to commit ensures we no longer retain the shard.
+			finishCommitted, err := checkpointer.commit(0 * time.Millisecond)
+			if err != nil {
+				k.shardErrors <- shardConsumerError{shardID: shardID, action: "checkpointer.commit", err: err}
+				return
+			}
+			if finishCommitted {
+				return
+			}
+			// Once we have committed the last sequence Number we passed to the user, return.
+			if !checkpointer.dirty && checkpointer.sequenceNumber == lastSeqToCheckp {
+				return
+			}
+			if timeoutCounter >= int(k.maxAgeForClientRecord/2) {
+				return
+			}
+		}
 	}
 }
