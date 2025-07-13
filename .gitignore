@@ -58,6 +58,6 @@ Temporary Items
 .arcconfig
 
 # Temporary integration test infrastructre
-/integration/.localstack
+/.localstack
 
 /config.mk
